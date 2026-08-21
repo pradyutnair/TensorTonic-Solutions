@@ -1,5 +1,6 @@
 import torch
 
+
 def stable_latent_moe(
     tokens,
     latent_down_projection,
@@ -18,177 +19,209 @@ def stable_latent_moe(
     up_cap=25.0
 ):
     """
+    tokens: (T, D)
+
     Returns:
-        final_output
-        selected_indices
-        mixture_weights
-        latent_routed_aggregate
+        final_output:     (T, D)
+        selected_indices: (T, k)
+        mixture_weights:  (T, k)
+        routed_aggregate: (T, L)
     """
 
-    # tokens: (T, D)
-    # T = number of token rows
-    # D = model width
-    #
-    # routed expert weights:
-    # (E, ..., ...)
-    # E = number of routed experts
-    #
-    # latent width = L
-    T,D = tokens.shape
-
-    # TODO 1: Compute RAW router scores from the original full-width tokens.
-    #
-    # tokens:            (T,D)
-    # router_projection: (E,D)
-    #
-    # raw_scores = sigmoid(W_r x)
-    # raw_scores: (T,E)
-    raw_scores = tokens @ router_projection.T
-    raw_scores = torch.sigmoid(raw_scores)
+    T, D = tokens.shape
 
 
-    # TODO 2: Add current expert bias ONLY for deciding which experts win.
-    #
-    # raw_scores:   (T,E)
-    # current_bias: (E,) -> broadcast across T
-    #
-    # biased_scores: (T,E)
-    biased_scores = raw_scores + current_bias
+    # ============================================================
+    # 1. ROUTING: decide which routed experts each token will use
+    # ============================================================
 
-    # TODO 3: Pick top-k routed experts independently for every token.
-    #
-    # selected_indices: (T,k)
-    selected_values, selected_indices = torch.topk(
+    # Each token gets one raw score for every routed expert.
+    # (T,D) @ (D,E) -> (T,E)
+    raw_scores = torch.sigmoid(
+        tokens @ router_projection.T
+    )  # (T,E)
+
+    # Bias affects WHICH experts are selected, not their mixture weights.
+    biased_scores = raw_scores + current_bias  # (T,E)
+
+    # Pick top-k experts independently for each token.
+    _, selected_indices = torch.topk(
         biased_scores,
         k=selected_count,
-        dim=1
-    )
+        dim=-1
+    )  # (T,k)
 
-    # TODO 4: Gather the RAW scores of those selected experts.
-    #
-    # Important:
-    # selection uses biased_scores,
-    # mixture weights use raw_scores.
-    #
-    # selected_raw_scores: (T,k)
+    # Get the RAW scores of only those selected experts.
     selected_raw_scores = torch.gather(
         raw_scores,
         dim=-1,
         index=selected_indices
-    )
+    )  # (T,k)
 
-    # TODO 5: Normalize selected raw scores per token.
-    #
-    # each row should sum to 1
-    #
-    # mixture_weights: (T,k)
+    # Convert selected raw scores into mixture weights.
+    # Each token's k weights sum to 1.
     mixture_weights = (
         selected_raw_scores
         / selected_raw_scores.sum(dim=-1, keepdim=True)
-    )                                                     # (m, k)
+    )  # (T,k)
 
 
-    # TODO 6: Down-project every token into latent width.
-    #
-    # tokens: (T,D)
-    # latent_down_projection: (L,D)
-    #
-    # z: (T,L)
-    z = tokens @ latent_down_projection.T 
+    # ============================================================
+    # 2. SHARED PATH: both shared experts process EVERY token at D
+    # ============================================================
 
-    # TODO 7: Run the TWO shared experts directly on full-width tokens.
-    #
-    # Each shared expert is a SiTU-GLU FFN:
-    #
-    # gate = W_gate x
-    # up   = W_up x
-    # activated = bounded_SiTU_gate(gate) * bounded_up(up)
-    # output = activated @ W_down^T
-    #
-    # shared_1: (T,D)
-    # shared_2: (T,D)
-    g = tokens @ shared_gate_weights[0].T
-    u = tokens @ shared_up_weights[0].T
-    
-    h = (
-        gate_cap * torch.tanh(g / gate_cap) * torch.sigmoid(g)
+    # ----- Shared expert 0 -----
+
+    shared_gate_0 = tokens @ shared_gate_weights[0].T
+    shared_up_0 = tokens @ shared_up_weights[0].T
+
+    shared_hidden_0 = (
+        gate_cap
+        * torch.tanh(shared_gate_0 / gate_cap)
+        * torch.sigmoid(shared_gate_0)
     ) * (
-        up_cap * torch.tanh(u / up_cap)
+        up_cap
+        * torch.tanh(shared_up_0 / up_cap)
     )
-    
-    shared_1 = h @ shared_down_weights[0].T
 
-    g = tokens @ shared_gate_weights[1].T
-    u = tokens @ shared_up_weights[1].T
-    
-    h = (
-        gate_cap * torch.tanh(g / gate_cap) * torch.sigmoid(g)
+    shared_output_0 = (
+        shared_hidden_0 @ shared_down_weights[0].T
+    )  # (T,D)
+
+
+    # ----- Shared expert 1 -----
+
+    shared_gate_1 = tokens @ shared_gate_weights[1].T
+    shared_up_1 = tokens @ shared_up_weights[1].T
+
+    shared_hidden_1 = (
+        gate_cap
+        * torch.tanh(shared_gate_1 / gate_cap)
+        * torch.sigmoid(shared_gate_1)
     ) * (
-        up_cap * torch.tanh(u / up_cap)
+        up_cap
+        * torch.tanh(shared_up_1 / up_cap)
     )
-    shared_2 = h @ shared_down_weights[1].T
-    
+
+    shared_output_1 = (
+        shared_hidden_1 @ shared_down_weights[1].T
+    )  # (T,D)
 
 
-    # TODO 8: Run selected routed experts in latent width.
-    routed_outputs = []
-    
+    # ============================================================
+    # 3. ROUTED PATH: compress tokens D -> L
+    # ============================================================
+
+    latent_tokens = (
+        tokens @ latent_down_projection.T
+    )  # (T,L)
+
+
+    # ============================================================
+    # 4. Run ONLY the selected routed experts on each latent token
+    # ============================================================
+
+    all_token_expert_outputs = []
+
     for t in range(T):
-        token_outputs = []
-    
+
+        # Outputs of this token's k selected experts.
+        token_expert_outputs = []
+
         for j in range(selected_count):
+
             expert_id = selected_indices[t, j]
-    
-            x = z[t]   # (L,)
-    
-            g = x @ routed_gate_weights[expert_id].T
-            u = x @ routed_up_weights[expert_id].T
-    
-            h = (
-                gate_cap * torch.tanh(g / gate_cap) * torch.sigmoid(g)
-            ) * (
-                up_cap * torch.tanh(u / up_cap)
+
+            # This expert receives the token in LATENT width.
+            latent_token = latent_tokens[t]  # (L,)
+
+            # Same SiTU-GLU FFN, but all computation happens in L.
+            expert_gate = (
+                latent_token @ routed_gate_weights[expert_id].T
             )
-    
-            expert_output = h @ routed_down_weights[expert_id].T   # (L,)
-    
-            token_outputs.append(expert_output)
-    
-        token_outputs = torch.stack(token_outputs, dim=0)   # (k,L)
-        routed_outputs.append(token_outputs)
-    
-    routed_outputs = torch.stack(routed_outputs, dim=0)     # (T,k,L)
-        
+
+            expert_up = (
+                latent_token @ routed_up_weights[expert_id].T
+            )
+
+            expert_hidden = (
+                gate_cap
+                * torch.tanh(expert_gate / gate_cap)
+                * torch.sigmoid(expert_gate)
+            ) * (
+                up_cap
+                * torch.tanh(expert_up / up_cap)
+            )
+
+            expert_output = (
+                expert_hidden
+                @ routed_down_weights[expert_id].T
+            )  # (L,)
+
+            token_expert_outputs.append(expert_output)
+
+        # k expert outputs for this token:
+        # k × (L,) -> (k,L)
+        token_expert_outputs = torch.stack(
+            token_expert_outputs,
+            dim=0
+        )  # (k,L)
+
+        all_token_expert_outputs.append(token_expert_outputs)
+
+    # T × (k,L) -> (T,k,L)
+    routed_outputs = torch.stack(
+        all_token_expert_outputs,
+        dim=0
+    )  # (T,k,L)
 
 
-    # TODO 9: Weight selected routed expert outputs using mixture_weights.
-    # mixture_weights: (T,k) -> (T,k,1)
+    # ============================================================
+    # 5. Combine the k routed experts for each token
+    # ============================================================
+
+    # mixture_weights: (T,k)   -> (T,k,1)
     # routed_outputs:  (T,k,L)
-    # weighted sum over k -> (T,L)
-    u = (
-        mixture_weights.unsqueeze(-1) * routed_outputs
+    #
+    # Multiply each expert output by its routing weight,
+    # then sum across the k selected experts.
+    routed_aggregate = (
+        mixture_weights.unsqueeze(-1)
+        * routed_outputs
     ).sum(dim=1)  # (T,L)
-    
-    
-    # TODO 10: RMS-normalize the routed latent aggregate over L.
-    # u:   (T,L)
-    # rms: (T,1)
+
+
+    # ============================================================
+    # 6. Normalize routed result and bring L -> D
+    # ============================================================
+
     rms = torch.sqrt(
-        torch.mean(u ** 2, dim=-1, keepdim=True) + eps
+        routed_aggregate.square().mean(
+            dim=-1,
+            keepdim=True
+        ) + eps
     )  # (T,1)
-    
-    norm_u = u / rms  # (T,L)
-    
-    
-    # TODO 11: Up-project routed latent result back to model width.
-    # (T,L) @ (L,D) -> (T,D)
-    routed_full = norm_u @ latent_up_projection.T  # (T,D)
-    
-    
-    # TODO 12: Merge the two shared full-width experts
-    # with the routed contribution.
-    final_output = shared_1 + shared_2 + routed_full  # (T,D)
-    
-    
-    # TODO 13: Return required outputs.
-    return final_output, selected_indices, mixture_weights, u
+
+    normalized_routed = routed_aggregate / rms  # (T,L)
+
+    routed_full_width = (
+        normalized_routed @ latent_up_projection.T
+    )  # (T,D)
+
+
+    # ============================================================
+    # 7. Merge all three paths
+    # ============================================================
+
+    final_output = (
+        shared_output_0
+        + shared_output_1
+        + routed_full_width
+    )  # (T,D)
+
+    return (
+        final_output,
+        selected_indices,
+        mixture_weights,
+        routed_aggregate
+    )
